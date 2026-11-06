@@ -1,0 +1,14 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# App bundle built by build.sh (attach the zip to a GitHub release instead)
+build/
+*.zip
+
+# macOS
+.DS_Store
+
+# Local Claude Code settings
+.claude/settings.local.json
