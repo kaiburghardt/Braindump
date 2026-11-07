@@ -17,6 +17,13 @@ struct BraindumpApp: App {
         .restorationBehavior(.disabled)
         .commands { NoteCommands(model: model) }
 
+        Window("History", id: "history") {
+            HistoryView(model: model)
+                .frame(minWidth: 640, minHeight: 360)
+        }
+        .defaultSize(width: 880, height: 600)
+        .restorationBehavior(.disabled)
+
         Settings {
             SettingsView(model: model)
         }
@@ -24,15 +31,23 @@ struct BraindumpApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Test runs only (`-notesPath …`): `-wnAppearance dark|light` forces the look, e.g. for screenshots.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        guard NotesModel.isTestRun, let look = UserDefaults.standard.string(forKey: "wnAppearance") else { return }
+        NSApp.appearance = NSAppearance(named: look == "dark" ? .darkAqua : .aqua)
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
         NotesModel.shared.saveNow()
+        NotesModel.shared.captureHistory()
     }
 }
 
 struct NoteCommands: Commands {
     let model: NotesModel
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {}
@@ -61,6 +76,19 @@ struct NoteCommands: Commands {
                 .keyboardShortcut("j", modifiers: .command)
             Button("Split into Separate Notes") { model.splitSelection() }
                 .keyboardShortcut("j", modifiers: [.command, .shift])
+            Divider()
+            Button("Tidy Up") { model.tidyUpAtSelection() }
+                .keyboardShortcut("t", modifiers: [.command, .control])
+                .disabled(!model.ai.isConfigured)
+            Button("Extract To-Dos") { model.extractAtSelection() }
+                .keyboardShortcut("e", modifiers: [.command, .control])
+                .disabled(!model.ai.isConfigured)
+            Button("Ask Braindump…") { model.askPresented = true }
+                .keyboardShortcut("k")
+                .disabled(!model.ai.isConfigured)
+            Divider()
+            Button("Show History") { openWindow(id: "history") }
+                .keyboardShortcut("y")
             Divider()
             Button("Archive Done To-Dos") { model.archiveDone() }
             Button("Refresh Suggestions") { model.reanalyzeAll() }

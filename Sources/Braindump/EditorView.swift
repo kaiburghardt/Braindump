@@ -26,7 +26,10 @@ final class NoteTextView: NSTextView, @MainActor NSLayoutManagerDelegate {
     var previewFor: ((URL) -> LinkPreview?)?
     var onPreviewClick: ((URL) -> Void)?
     var selectionActions: ((NSRange) -> [SelectionAction])?
-    var fontSize: CGFloat = 15
+    /// Is the note starting at this index waiting for an AI answer? Its icon then pulses.
+    var isAIBusyAt: ((Int) -> Bool)?
+    var editorFont = EditorFont(family: EditorFont.defaultFamily, size: 15)
+    var fontSize: CGFloat { editorFont.size }
 
     private var hoverLine: (start: Int, rect: NSRect)?
     private var pillRects: [(rect: NSRect, url: URL)] = []
@@ -192,6 +195,12 @@ final class NoteTextView: NSTextView, @MainActor NSLayoutManagerDelegate {
                 view.frame = iconRect
                 view.toolTip = symbol.help
                 view.isHidden = false
+                let busy = isAIBusyAt?(paragraph.location) ?? false
+                if busy != (view.identifier == Self.busyIcon) {
+                    view.identifier = busy ? Self.busyIcon : nil
+                    view.removeAllSymbolEffects()
+                    if busy { view.addSymbolEffect(.pulse) }
+                }
 
                 if span.lineCount > 1 {
                     let lastGlyphs = lm.glyphRange(forCharacterRange: NSRange(location: span.lastLine.location, length: max(1, span.lastLine.length)), actualCharacterRange: nil)
@@ -245,8 +254,13 @@ final class NoteTextView: NSTextView, @MainActor NSLayoutManagerDelegate {
         return NSRect(x: textContainerOrigin.x - 28, y: lineRect.midY - size / 2, width: size, height: size)
     }
 
+    private static let busyIcon = NSUserInterfaceItemIdentifier("aiBusy")
+
     private func gutterSymbol(for index: Int, hovered: Bool = true) -> (name: String, colors: [NSColor], help: String)? {
         guard let type = noteSpanAt?(index)?.type else { return nil }
+        if isAIBusyAt?(index) == true {
+            return ("sparkles", [.systemPurple], "The AI is working on this note …")
+        }
         switch type {
         case .note:
             return ("circle.dashed", [hovered ? .labelColor : .secondaryLabelColor],
@@ -263,6 +277,7 @@ final class NoteTextView: NSTextView, @MainActor NSLayoutManagerDelegate {
 
     override func didChangeText() {
         super.didChangeText()
+        redrawVisibleText()
         hidePopup()
         // The type or position of the line under the mouse may have changed.
         if let hover = hoverLine { hoverLine = lineInfo(atY: hover.rect.midY) }
@@ -324,12 +339,22 @@ final class NoteTextView: NSTextView, @MainActor NSLayoutManagerDelegate {
     func applyNoteStyles(_ styles: [NoteStyle], restyling range: NSRange?) {
         guard let storage = textStorage, storage.length > 0 else { return }
         storage.beginEditing()
-        if let range { Styler.style(storage, around: range, fontSize: fontSize) }
+        if let range { Styler.style(storage, around: range, font: editorFont) }
         for style in styles where NSMaxRange(style.title) <= storage.length {
-            Styler.applyType(style.type, title: style.title, details: style.details, in: storage, fontSize: fontSize)
+            Styler.applyType(style.type, title: style.title, details: style.details, in: storage, font: editorFont)
         }
         storage.endEditing()
         restyledRange = nil
+        redrawVisibleText()
+    }
+
+    /// Restyling the lines around an edit (styles depend on the neighbouring lines) makes AppKit
+    /// miss part of the redraw: after deleting a line the text below it sometimes stayed on
+    /// screen one line too low (a line seemed to appear twice) until the next edit. The layout
+    /// itself is right, so the visible part is simply redrawn after every change.
+    /// `Tools/ui_test.sh` checks this by comparing the window before and after a full redraw.
+    func redrawVisibleText() {
+        setNeedsDisplay(visibleRect)
     }
 
     // MARK: Pop-up above a multi-line selection
@@ -468,6 +493,50 @@ private final class ClosureMenuItem: NSMenuItem {
     @objc private func run() { handler() }
 }
 
+/// The editor's font: a family from the settings and a size. Hands out the weights the styling
+/// uses (medium titles, semibold radar items, bold headings); families without them fall back to
+/// the nearest weight they have.
+struct EditorFont: Equatable {
+    var family: String
+    var size: CGFloat
+
+    /// Monospaced by default – plain-text style, like TextEdit's “Make Plain Text”.
+    static let defaultFamily = systemMono
+    static let systemMono = "SF Mono"
+    static let system = "SF Pro"
+    static let systemSerif = "New York"
+
+    /// Shown first in Settings (only the ones installed on this Mac).
+    static let monospacedChoices = [systemMono, "Menlo", "Monaco", "Courier New", "Andale Mono"]
+    static let proportionalChoices = [system, systemSerif, "Helvetica Neue", "Avenir Next", "Charter", "Georgia"]
+
+    static func isAvailable(_ family: String) -> Bool {
+        [systemMono, system, systemSerif].contains(family) || NSFontManager.shared.availableFontFamilies.contains(family)
+    }
+
+    @MainActor private static var cache: [String: NSFont] = [:]
+
+    @MainActor
+    func font(_ weight: NSFont.Weight = .regular, scale: CGFloat = 1) -> NSFont {
+        let size = round(self.size * scale)
+        let key = "\(family)|\(size)|\(weight.rawValue)"
+        if let cached = Self.cache[key] { return cached }
+        let font: NSFont = switch family {
+        case Self.systemMono: .monospacedSystemFont(ofSize: size, weight: weight)
+        case Self.system: .systemFont(ofSize: size, weight: weight)
+        case Self.systemSerif:
+            NSFont.systemFont(ofSize: size, weight: weight).fontDescriptor.withDesign(.serif)
+                .flatMap { NSFont(descriptor: $0, size: size) } ?? .systemFont(ofSize: size, weight: weight)
+        default:
+            NSFont(descriptor: NSFontDescriptor(fontAttributes: [.family: family, .traits: [NSFontDescriptor.TraitKey.weight: weight]]), size: size)
+                .flatMap { $0.familyName == family ? $0 : nil }
+                ?? .monospacedSystemFont(ofSize: size, weight: weight)
+        }
+        Self.cache[key] = font
+        return font
+    }
+}
+
 /// Styles the text lightly – type-independent parts while typing, type styling via `applyType`.
 @MainActor
 enum Styler {
@@ -478,16 +547,16 @@ enum Styler {
         return p
     }
 
-    static func baseAttributes(_ size: CGFloat) -> [NSAttributedString.Key: Any] {
-        [.font: NSFont.systemFont(ofSize: size),
+    static func baseAttributes(_ font: EditorFont) -> [NSAttributedString.Key: Any] {
+        [.font: font.font(),
          .foregroundColor: NSColor.labelColor,
-         .paragraphStyle: paragraphStyle(size)]
+         .paragraphStyle: paragraphStyle(font.size)]
     }
 
     /// Restyles the paragraphs around `range` (plus one line before and after) and returns
     /// the range that was restyled.
     @discardableResult
-    static func style(_ storage: NSTextStorage, around range: NSRange, fontSize size: CGFloat) -> NSRange {
+    static func style(_ storage: NSTextStorage, around range: NSRange, font: EditorFont) -> NSRange {
         let ns = storage.string as NSString
         let length = ns.length
         guard length > 0 else { return NSRange(location: 0, length: 0) }
@@ -501,9 +570,9 @@ enum Styler {
             paragraphs = NSUnionRange(paragraphs, ns.paragraphRange(for: NSRange(location: NSMaxRange(paragraphs), length: 0)))
         }
 
-        let base = baseAttributes(size)
-        let medium = NSFont.systemFont(ofSize: size, weight: .medium)
-        let heading = NSFont.systemFont(ofSize: round(size * 1.3), weight: .bold)
+        let base = baseAttributes(font)
+        let medium = font.font(.medium)
+        let heading = font.font(.bold, scale: 1.3)
 
         /// Kind of the line directly before/after (nil at the start/end of the document).
         func neighbor(before location: Int) -> LineKind? {
@@ -574,7 +643,7 @@ enum Styler {
     }
 
     /// Type styling on top of the base styling.
-    static func applyType(_ type: NoteType, title: NSRange, details: NSRange?, in storage: NSTextStorage, fontSize size: CGFloat) {
+    static func applyType(_ type: NoteType, title: NSRange, details: NSRange?, in storage: NSTextStorage, font: EditorFont) {
         switch type {
         case .done:
             for range in [title, details].compactMap({ $0 }) {
@@ -583,7 +652,7 @@ enum Styler {
                                        .strikethroughColor: NSColor.tertiaryLabelColor], range: range)
             }
         case .radar:
-            storage.addAttribute(.font, value: NSFont.systemFont(ofSize: size, weight: .semibold), range: title)
+            storage.addAttribute(.font, value: font.font(.semibold), range: title)
         case .todo, .note:
             break
         }
@@ -604,6 +673,7 @@ struct EditorView: NSViewRepresentable {
         layoutManager.addTextContainer(container)
 
         let tv = NoteTextView(frame: .zero, textContainer: container)
+        layoutManager.delegate = tv
         tv.minSize = .zero
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         tv.isVerticallyResizable = true
@@ -626,10 +696,10 @@ struct EditorView: NSViewRepresentable {
         tv.linkTextAttributes = [.foregroundColor: NSColor.linkColor,
                                  .underlineStyle: NSUnderlineStyle.single.rawValue,
                                  .cursor: NSCursor.pointingHand]
-        let size = CGFloat(model.fontSize)
-        tv.font = .systemFont(ofSize: size)
-        tv.fontSize = size
-        tv.typingAttributes = Styler.baseAttributes(size)
+        let font = model.editorFont
+        tv.editorFont = font
+        tv.font = font.font()
+        tv.typingAttributes = Styler.baseAttributes(font)
         tv.delegate = context.coordinator
         storage.delegate = context.coordinator
         context.coordinator.textView = tv
@@ -648,11 +718,12 @@ struct EditorView: NSViewRepresentable {
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
-        let size = CGFloat(model.fontSize)
-        guard let tv = scroll.documentView as? NoteTextView, size != tv.fontSize else { return }
-        tv.fontSize = size
-        tv.typingAttributes = Styler.baseAttributes(size)
-        model.fontSizeChanged()
+        let font = model.editorFont
+        guard let tv = scroll.documentView as? NoteTextView, font != tv.editorFont else { return }
+        tv.editorFont = font
+        tv.font = font.font()
+        tv.typingAttributes = Styler.baseAttributes(font)
+        model.editorFontChanged()
     }
 
     @MainActor
@@ -682,7 +753,7 @@ struct EditorView: NSViewRepresentable {
         func textStorage(_ textStorage: NSTextStorage, didProcessEditing editedMask: NSTextStorageEditActions,
                          range editedRange: NSRange, changeInLength delta: Int) {
             guard editedMask.contains(.editedCharacters), let tv = textView else { return }
-            let restyled = Styler.style(textStorage, around: editedRange, fontSize: tv.fontSize)
+            let restyled = Styler.style(textStorage, around: editedRange, font: tv.editorFont)
             tv.noteRestyled(restyled)
         }
 

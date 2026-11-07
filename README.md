@@ -20,7 +20,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-    <img src="docs/screenshot-light.png" width="900" alt="Braindump window: notes and to-dos on the left; on the right the radar, the to-do list and a suggestion to turn a note into a to-do">
+    <img src="docs/screenshot-light.png" width="900" alt="Braindump window: notes and to-dos on the left, with buttons for to-do, radar, the AI actions and history above them; on the right the radar, the to-do list and a suggestion to turn a note into a to-do">
   </picture>
 </p>
 
@@ -28,7 +28,9 @@
 
 - ✍️ **Just type.** No save button, no folders. Lines that sit together are one note, and a blank line starts the next one.
 - ✅ **To-dos and radar.** Turn any note into a to-do with ⌘↩, or put it on your radar with ⇧⌘↩. Radar is for things other people are working on that you only want to check every few days.
-- ✨ **Suggestions that stay on your Mac.** A small on-device model notices when a note looks like a to-do or a radar item and offers to convert it.
+- ✨ **Suggestions.** A model notices when a note looks like a to-do or a radar item and offers to convert it. By default it's a small model that runs on your Mac.
+- 🪄 **AI on one click (optional).** Connect any OpenAI-compatible server (for example a LiteLLM proxy) and pick a small, fast model. **Tidy Up** turns a dictated, rambling note into a clear title with details. **Extract To-Dos** turns meeting notes or a pasted thread into separate to-dos and radar items. **Ask Braindump** (⌘K) answers questions about all your notes.
+- 🕘 **History.** Wrote something and deleted it again? ⌘Y shows what changed in the last hours, puts deleted notes back or restores a whole version.
 - 🔗 **Jira and Notion previews.** A link at the end of a line shows the ticket's or page's status and title.
 - 📄 **Your notes stay readable.** Everything lives in one JSON file in Documents. You can edit it by hand, and Braindump picks up the changes live.
 
@@ -61,12 +63,22 @@ Or [build it yourself](#building-from-source).
    - **Merge into one note** (the first one stays the title, the others become details)
    - **Split into separate notes**
    - make the selected notes **to-dos** or put them on the **radar**
-6. **Suggestions.** When you leave a line, a model looks at each note's title. If it looks like a to-do or like something for your radar, a suggestion appears in the sidebar. Everything runs on your Mac:
-   - Apple Intelligence when it's available,
+6. **Suggestions.** When you leave a line, a model looks at each note's title. If it looks like a to-do or like something for your radar, a suggestion appears in the sidebar. The model is:
+   - the AI server you set up, if you did (see [below](#connecting-an-ai-server)),
+   - otherwise Apple Intelligence when it's available,
    - otherwise a tiny model of its own (about 1.3 MB, Apple frameworks only). It trains once on first launch (~30 s) and then learns from what you mark, accept or dismiss.
-7. **Jira and Notion.** A Jira or Notion link at the end of a line gets a pill with its status and title. The radar and to-do lists show it too. This needs a token once, see [below](#connecting-jira-and-notion).
 
-Braindump saves shortly after you type, when you switch apps, and when you quit.
+   The ↻ button at the bottom of the sidebar looks at all notes again.
+7. **AI actions** (once an AI server is set up). They're in the toolbar (wand, list and speech bubbles, between the to-do/radar buttons and History), in the Note menu, in the right-click menu of a note's icon and in the pop-up over selected lines:
+   - **Tidy Up (⌃⌘T)** rewrites the note at the cursor as a short title plus detail lines. It fixes dictation mistakes and keeps the language, every name, number and link.
+   - **Extract To-Dos (⌃⌘E)** reads the selected text (or the note at the cursor) and adds what's in it as separate notes below it: to-dos, radar items and notes worth keeping. The original stays.
+   - **Ask Braindump (⌘K)** answers a question about your notes ("What am I waiting on?") and links the notes it's based on.
+
+   While the AI works, the note's icon turns into a pulsing sparkle. If you edit the note in the meantime, the answer is thrown away instead of overwriting your text. Every change can be undone with ⌘Z.
+8. **Jira and Notion.** A Jira or Notion link at the end of a line gets a pill with its status and title. The radar and to-do lists show it too. Statuses are refreshed about every 5 minutes while Braindump runs. This needs a token once, see [below](#connecting-jira-and-notion).
+9. **History (⌘Y or the clock in the toolbar).** Braindump keeps every version of your notes from the last 24 hours (1 hour to 7 days in Settings), and always at least the last 1,000, however old. A version is taken after a pause in typing, and always right before text gets deleted. Each version shows what changed: added, deleted and edited notes, line by line, and type changes. **Put Back** returns a deleted note to its old place, **Restore This Version** brings back everything (undo with ⌘Z).
+
+Braindump saves shortly after you type, when you switch apps, and when you quit. The editor uses a monospaced font (SF Mono) by default; pick another font in Settings. The sidebar lists your notes in the same font. Copying from the editor gives plain text.
 
 ### Typing shortcuts
 
@@ -84,6 +96,10 @@ Braindump saves shortly after you type, when you switch apps, and when you quit.
 | ⌘J | Merge the selected lines into one note |
 | ⇧⌘J | Split the selected lines into separate notes |
 | ⌘Z / ⇧⌘Z | Undo / redo (text and type changes) |
+| ⌘Y | History |
+| ⌃⌘T | Tidy Up (AI) |
+| ⌃⌘E | Extract To-Dos (AI) |
+| ⌘K | Ask Braindump (AI) |
 | ⌥⌘I | Show/hide the sidebar |
 | ⌘F | Find |
 | ⌘, | Settings |
@@ -97,9 +113,21 @@ Both live in **Settings (⌘,) → Connections**. Tokens are stored in the macOS
 
 Until a connection is set up, the link shows "Connect Jira …" / "Connect Notion …". Clicking it opens the settings.
 
+## Connecting an AI server
+
+The AI features are optional and off until you set them up in **Settings (⌘,) → Connections → AI Server**:
+
+1. Enter the address of any OpenAI-compatible server: a [LiteLLM](https://github.com/BerriAI/litellm) proxy, OpenAI, or a model server on your Mac (plain `http://` only works for `localhost`).
+2. Paste an API key if the server needs one. It's stored in the macOS Keychain.
+3. Click "Save & Test". Braindump lists the server's models; pick a small, fast one (Haiku-, mini- or flash-class models work well).
+
+Braindump asks for structured JSON answers with low reasoning effort. If a model doesn't support one of these options, Braindump retries without it.
+
+What gets sent: the titles (and first detail lines) of plain notes for suggestions, the note or selection you run Tidy Up or Extract To-Dos on, and all notes of the file when you ask a question. Nothing else, and nothing at all without a server.
+
 ## Where your data lives
 
-Nothing leaves your Mac, except the Jira and Notion lookups you set up yourself.
+Nothing leaves your Mac, except the Jira and Notion lookups and the AI server you set up yourself.
 
 Your notes are readable JSON in `~/Documents/Braindump/Braindump.json`, one entry per note:
 
@@ -123,7 +151,7 @@ Your notes are readable JSON in `~/Documents/Braindump/Braindump.json`, one entr
 - `Braindump-Archive.json` appears once you use "Archive Done".
 - Settings → "Choose Another File…" opens another Braindump file or imports a plain text file.
 
-`~/Library/Application Support/Braindump/` holds the daily backups (last 30), the trained mini model, what you taught it, the suggestions you dismissed and the link preview cache.
+`~/Library/Application Support/Braindump/` holds the daily backups (last 30), the history (`History/`, plain copies of the notes file, removed once they're older than the time set in Settings and not among the last 1,000), the trained mini model, what you taught it, the suggestions you dismissed and the link preview cache.
 
 ## Building from source
 
@@ -134,6 +162,8 @@ Requirements: macOS 26+, Xcode with Swift 6.2+. No Xcode project needed, it's a 
 ```
 
 This builds the app (release, ad-hoc signed, no developer account needed), copies it to `~/Applications/Braindump.app` and launches it. Without `--install` it only lands in `build/`.
+
+`Tools/ui_test.sh` runs a test copy in the background (its own notes file) through a series of edits and checks the window for drawing glitches.
 
 Because the ad-hoc signature changes with every build, macOS asks again for access to Documents after each rebuild, and the Keychain asks once for your password. Signing with your own certificate avoids that:
 

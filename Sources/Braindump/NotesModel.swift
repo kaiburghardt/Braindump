@@ -25,6 +25,7 @@ final class NotesModel {
         static let path = "notesPath"
         static let interval = "checkIntervalDays"
         static let fontSize = "fontSize"
+        static let fontFamily = "fontFamily"
         static let ai = "aiEnabled"
     }
 
@@ -52,6 +53,10 @@ final class NotesModel {
     var fontSize: Double {
         didSet { UserDefaults.standard.set(fontSize, forKey: Keys.fontSize) }
     }
+    var fontFamily: String {
+        didSet { UserDefaults.standard.set(fontFamily, forKey: Keys.fontFamily) }
+    }
+    var editorFont: EditorFont { EditorFont(family: fontFamily, size: CGFloat(fontSize)) }
     var aiEnabled: Bool {
         didSet {
             UserDefaults.standard.set(aiEnabled, forKey: Keys.ai)
@@ -72,9 +77,17 @@ final class NotesModel {
     private(set) var suggestions: [Suggestion] = []
     private(set) var saveStatus: SaveStatus = .saved
     private(set) var now = Date()
+    /// Type of the note the cursor is in (nil on a blank line) – for the toolbar buttons.
+    private(set) var cursorNoteType: NoteType?
+    /// Short message about the last AI action, shown over the editor for a few seconds.
+    private(set) var aiNotice: String?
+    /// The Ask sheet (⌘K).
+    var askPresented = false
 
     let engine = SuggestionEngine()
     let links = LinkPreviewService()
+    let ai = AIService()
+    let history = HistoryStore()
 
     @ObservationIgnored weak var textView: NoteTextView?
     @ObservationIgnored private var appState = AppState()
@@ -99,6 +112,14 @@ final class NotesModel {
     @ObservationIgnored private var retrainTask: Task<Void, Never>?
     @ObservationIgnored private var lastEditLocation: Int?
     @ObservationIgnored private var isProgrammaticEdit = false
+    // History: states waiting to be written, and the state before the current run of deletions
+    @ObservationIgnored private var pendingHistory: [(date: Date, file: NotesFile)] = []
+    @ObservationIgnored private var deletionRun: (date: Date, file: NotesFile, deleted: Int, kept: Bool)?
+    @ObservationIgnored private var historyTask: Task<Void, Never>?
+    @ObservationIgnored private var lastHistoryCapture = Date.distantPast
+    /// Notes waiting for an AI answer – their icon pulses.
+    @ObservationIgnored private var aiBusy: Set<String> = []
+    @ObservationIgnored private var noticeTask: Task<Void, Never>?
 
     private var appStateURL: URL { Self.supportURL.appending(path: "state.json") }
     private var archiveURL: URL {
@@ -108,9 +129,11 @@ final class NotesModel {
     private init() {
         Self.migrateFromWriteNotes()
         let d = UserDefaults.standard
-        d.register(defaults: [Keys.interval: 4, Keys.fontSize: 15.0, Keys.ai: true])
+        d.register(defaults: [Keys.interval: 4, Keys.fontSize: 14.0, Keys.fontFamily: EditorFont.defaultFamily, Keys.ai: true])
         checkIntervalDays = max(1, d.integer(forKey: Keys.interval))
         fontSize = d.double(forKey: Keys.fontSize)
+        let family = d.string(forKey: Keys.fontFamily) ?? EditorFont.defaultFamily
+        fontFamily = EditorFont.isAvailable(family) ? family : EditorFont.defaultFamily
         aiEnabled = d.bool(forKey: Keys.ai)
         var url = Self.defaultURL
         if let path = d.string(forKey: Keys.path), !path.isEmpty {
@@ -123,6 +146,11 @@ final class NotesModel {
         }
         fileURL = url
 
+        engine.ai = ai
+        ai.onChange = { [weak self] in
+            self?.engine.refreshAvailability()
+            self?.textView?.scheduleIconRefresh()
+        }
         engine.onResults = { [weak self] in self?.recomputeSuggestions() }
         engine.onBackendChange = { [weak self] in
             self?.recomputeSuggestions()
@@ -136,6 +164,8 @@ final class NotesModel {
         startBackgroundLoop()
         observeAppLifecycle()
         SelfTest.runIfRequested(model: self)
+        SelfTest.runAIProbeIfRequested(model: self)
+        RenderTest.runIfRequested(model: self)
     }
 
     /// One-time: take over data, backups and settings of the old "WriteNotes" version.
@@ -204,6 +234,8 @@ final class NotesModel {
         if loaded {
             saveNow() // only writes if something got normalized while reading
             makeDailyBackup()
+            history.open(for: fileURL, defaultFile: Self.defaultURL, supportFolder: Self.supportURL)
+            captureHistory()
         }
         scheduleAnalysis(after: .milliseconds(400))
     }
@@ -262,14 +294,14 @@ final class NotesModel {
         saveTask?.cancel()
         saveTask = nil
         guard loaded else { return } // never overwrite a file we couldn't read
-        let file = NotesFile(notes: notes.enumerated().map { StoredNote($0.element, index: $0.offset) })
-        let data = file.encoded()
+        let data = currentFile().encoded()
         if data != lastSavedData {
             do {
                 try data.write(to: fileURL, options: .atomic)
                 lastSavedData = data
                 lastModDate = Self.modificationDate(of: fileURL)
                 if saveStatus != .saved { saveStatus = .saved }
+                scheduleHistoryCapture()
             } catch {
                 saveStatus = .failed("Saving failed: \(error.localizedDescription)")
             }
@@ -277,6 +309,11 @@ final class NotesModel {
         if appStateDirty {
             saveAppState()
         }
+    }
+
+    /// The notes as they'd be written to the file.
+    func currentFile() -> NotesFile {
+        NotesFile(notes: notes.enumerated().map { StoredNote($0.element, index: $0.offset) })
     }
 
     private func scheduleSave() {
@@ -367,6 +404,7 @@ final class NotesModel {
         textView.previewFor = { [weak self] url in self?.links.preview(for: url) }
         textView.onPreviewClick = { [weak self] url in self?.openPreview(url) }
         textView.selectionActions = { [weak self] range in self?.selectionActions(for: range) ?? [] }
+        textView.isAIBusyAt = { [weak self] index in self?.isAIBusy(at: index) ?? false }
         setEditorText(text)
         restyleAll()
     }
@@ -401,6 +439,7 @@ final class NotesModel {
     func editorDidChange(_ newText: String, editLocation: Int?) {
         guard newText != text else { return }
         let undoing = textView?.undoManager.map { $0.isUndoing || $0.isRedoing } ?? false
+        keepStateBeforeDeletion(old: text, new: newText) // `notes` still describe the old text here
         text = newText
         lastEditLocation = isProgrammaticEdit ? nil : editLocation
         // Typing anywhere else than on the pending "next to-do" line drops it.
@@ -418,6 +457,7 @@ final class NotesModel {
 
     /// When the cursor leaves the line that was just typed in, that line may be analyzed.
     func selectionDidChange(to location: Int) {
+        updateCursorNoteType(at: location)
         guard let edit = lastEditLocation, line(containing: location)?.index != line(containing: edit)?.index else { return }
         lastEditLocation = nil
         scheduleAnalysis(after: .milliseconds(500))
@@ -479,6 +519,13 @@ final class NotesModel {
         updateBadge()
         scheduleLinkRefresh()
         textView?.scheduleIconRefresh()
+        updateCursorNoteType()
+    }
+
+    private func updateCursorNoteType(at location: Int? = nil) {
+        guard let location = location ?? textView?.selectedRange().location else { return }
+        let type = line(containing: location).flatMap { $0.kind == .blank ? nil : note(containingLine: $0.index)?.type }
+        if type != cursorNoteType { cursorNoteType = type }
     }
 
     /// Maps the blocks to the IDs of the previous pass: same title first, then a similar title
@@ -593,6 +640,22 @@ final class NotesModel {
         }
     }
 
+    /// Up to 8 of your own decisions per label, as examples for the AI server's prompt: what you
+    /// turned notes into (to-dos and radar items in the file, plus learned clicks and dismissals).
+    private func promptExamples() -> [(text: String, label: String)] {
+        var own: [String: String] = [:]
+        for note in notes where note.title.count >= 6 && !note.title.hasPrefix("http") && note.type != .note {
+            own[note.title] = note.type.label
+        }
+        own.merge(appState.learned) { _, learned in learned }
+        var result: [(text: String, label: String)] = []
+        for label in ["todo", "radar", "note"] {
+            let texts = own.filter { $0.value == label && $0.key.count >= 6 }.keys.sorted()
+            result += texts.prefix(8).map { (text: $0, label: label) }
+        }
+        return result
+    }
+
     /// Base examples + what you marked yourself (your labels count three times).
     private func trainingExamples() -> [LineExample] {
         var examples = LineExample.bundled()
@@ -646,12 +709,14 @@ final class NotesModel {
         let dismissed = Set(appState.dismissedSuggestions)
         let activeKey = activeLineKey()
         var seen = Set<String>()
-        var items: [(key: String, text: String)] = []
+        var items: [ClassifyCandidate] = []
         for note in notes where note.type == .note {
             guard note.title.count >= 6, note.key != activeKey, !dismissed.contains(note.key),
                   engine.verdicts[note.key] == nil, seen.insert(note.key).inserted else { continue }
-            items.append((note.key, note.title))
+            items.append(ClassifyCandidate(key: note.key, text: note.title, details: note.detailLines.prefix(2).map(\.body)))
         }
+        guard !items.isEmpty else { return }
+        if engine.backend == .server { engine.examples = promptExamples() }
         engine.enqueue(items)
     }
 
@@ -744,6 +809,12 @@ final class NotesModel {
         if note.type == .radar, let item = radarItems.first(where: { $0.id == note.id }) {
             items.append(GutterMenuItem(title: "Checked Today", symbol: "checkmark", separatorBefore: true) { [weak self] in self?.markChecked(item) })
         }
+        if ai.isConfigured {
+            items.append(GutterMenuItem(title: "Tidy Up", symbol: "sparkles", separatorBefore: true) { [weak self] in self?.tidyUp(note) })
+            items.append(GutterMenuItem(title: "Extract To-Dos", symbol: "list.bullet.indent") { [weak self] in
+                self?.extract(from: note.range, after: note)
+            })
+        }
         return items
     }
 
@@ -820,6 +891,137 @@ final class NotesModel {
         return notesTouched(by: linesInSelection(tv.selectedRange()).filter { $0.kind != .blank })
     }
 
+    // MARK: - AI actions (Tidy Up, Extract To-Dos)
+    //
+    // The request runs in the background; the note's icon pulses meanwhile. The answer is only
+    // applied if the note's text is still exactly what was sent – otherwise nothing is replaced.
+    // Edits go through `performEdits`, so one ⌘Z undoes them.
+
+    func isAIBusy(at index: Int) -> Bool {
+        noteByStart[index].map { aiBusy.contains($0.id) } ?? false
+    }
+
+    /// ⌃⌘T: the note at the cursor, or every note in the selection (at most 10).
+    func tidyUpAtSelection() {
+        for note in notesAtSelection().prefix(10) { tidyUp(note) }
+    }
+
+    /// Turns a dictated or rambling note into a short title plus detail lines (same language,
+    /// same facts and links).
+    func tidyUp(_ note: Note) {
+        guard ai.isConfigured else { showAINotice(AIService.Failure.notConfigured.message); return }
+        guard !note.title.isEmpty, aiBusy.insert(note.id).inserted else { return }
+        let id = note.id
+        let type = note.type
+        let original = Self.text(of: note)
+        textView?.scheduleIconRefresh()
+        Task {
+            defer { finishAI(id) }
+            do throws(AIService.Failure) {
+                let tidied = try await AIActions.tidy(original, ai: ai)
+                let replacement = AIActions.render(title: tidied.title, details: tidied.details)
+                guard let current = notes.first(where: { $0.id == id }), Self.text(of: current) == original else {
+                    showAINotice("The note changed while the AI was working – nothing was replaced.")
+                    return
+                }
+                guard !AIActions.cleanTitle(tidied.title).isEmpty, replacement != original else {
+                    showAINotice("Nothing to tidy up.")
+                    return
+                }
+                guard AIActions.missingURLs(original: original, result: replacement).isEmpty else {
+                    showAINotice("Tidy Up left out a link, so nothing was changed.")
+                    return
+                }
+                // The note keeps its ID (and type) through the edit; this is a safety net.
+                pendingTypes[NoteParser.key(AIActions.cleanTitle(tidied.title))] = type
+                performEdits([(current.range, replacement)], actionName: "Tidy Up")
+            } catch {
+                showAINotice(error.message)
+            }
+        }
+    }
+
+    /// ⌃⌘E: the selected text – or the note at the cursor – becomes separate notes below it.
+    func extractAtSelection() {
+        guard let tv = textView, let last = notesAtSelection().last else { return }
+        let selection = tv.selectedRange()
+        extract(from: selection.length > 0 ? selection : last.range, after: last)
+    }
+
+    /// Asks the AI for the to-dos, radar items and notes in a piece of text and inserts them as
+    /// separate notes after `anchor`. The source text stays as it is.
+    func extract(from source: NSRange, after anchor: Note) {
+        guard ai.isConfigured else { showAINotice(AIService.Failure.notConfigured.message); return }
+        let ns = text as NSString
+        guard NSMaxRange(source) <= ns.length else { return }
+        let original = ns.substring(with: source)
+        guard original.trimmingCharacters(in: .whitespacesAndNewlines).count >= 3, aiBusy.insert(anchor.id).inserted else { return }
+        let anchorID = anchor.id
+        textView?.scheduleIconRefresh()
+        Task {
+            defer { finishAI(anchorID) }
+            do throws(AIService.Failure) {
+                let result = try await AIActions.extract(original, today: Date(), ai: ai)
+                guard let anchorNow = notes.first(where: { $0.id == anchorID }),
+                      (text as NSString).range(of: original).location != NSNotFound else {
+                    showAINotice("The text changed while the AI was working – nothing was added.")
+                    return
+                }
+                var blocks: [String] = []
+                for item in result.items.prefix(15) {
+                    let title = AIActions.cleanTitle(item.title)
+                    guard !title.isEmpty else { continue }
+                    blocks.append(AIActions.render(title: title, details: item.details))
+                    switch item.type {
+                    case "todo": pendingTypes[NoteParser.key(title)] = .todo
+                    case "radar": pendingTypes[NoteParser.key(title)] = .radar
+                    default: break
+                    }
+                }
+                guard !blocks.isEmpty else {
+                    showAINotice("No to-dos found in this text.")
+                    return
+                }
+                let location = NSMaxRange(anchorNow.range)
+                performEdits([(NSRange(location: location, length: 0), "\n\n" + blocks.joined(separator: "\n\n"))],
+                             actionName: "Extract To-Dos")
+                if let tv = textView {
+                    let first = NSRange(location: min(location + 2, (tv.string as NSString).length), length: 0)
+                    tv.setSelectedRange(first)
+                    tv.scrollRangeToVisible(first)
+                }
+                showAINotice("Added \(blocks.count) \(blocks.count == 1 ? "note" : "notes") below.")
+            } catch {
+                showAINotice(error.message)
+            }
+        }
+    }
+
+    func showAINotice(_ message: String) {
+        aiNotice = message
+        noticeTask?.cancel()
+        noticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled else { return }
+            self?.aiNotice = nil
+        }
+    }
+
+    func dismissAINotice() {
+        noticeTask?.cancel()
+        aiNotice = nil
+    }
+
+    private func finishAI(_ id: String) {
+        aiBusy.remove(id)
+        textView?.scheduleIconRefresh()
+    }
+
+    /// The note's text exactly as in the editor (all its lines).
+    private static func text(of note: Note) -> String {
+        note.allLines.map(\.raw).joined(separator: "\n")
+    }
+
     // MARK: - Several lines: merge & split
 
     /// What the pop-up above a multi-line selection offers.
@@ -846,6 +1048,14 @@ final class NotesModel {
         actions.append(SelectionAction(title: "Radar", systemImage: "scope") { [weak self] in
             self?.setType(.radar, for: touched)
         })
+        if ai.isConfigured {
+            actions.append(SelectionAction(title: "Tidy Up", systemImage: "sparkles") { [weak self] in
+                self?.tidyUpAtSelection()
+            })
+            actions.append(SelectionAction(title: "Extract To-Dos", systemImage: "list.bullet.indent") { [weak self] in
+                self?.extractAtSelection()
+            })
+        }
         return actions
     }
 
@@ -942,7 +1152,7 @@ final class NotesModel {
         tv.applyNoteStyles(notes.map(style(for:)), restyling: NSRange(location: 0, length: (text as NSString).length))
     }
 
-    func fontSizeChanged() {
+    func editorFontChanged() {
         restyleAll()
         textView?.scheduleIconRefresh()
     }
@@ -1059,7 +1269,10 @@ final class NotesModel {
     private func observeAppLifecycle() {
         let center = NotificationCenter.default
         center.addObserver(forName: NSApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.saveNow() }
+            MainActor.assumeIsolated {
+                self?.saveNow()
+                self?.captureHistory()
+            }
         }
         center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -1079,12 +1292,135 @@ final class NotesModel {
         guard data != lastSavedData else { return }
         guard let file = try? NotesFile.decoder.decode(NotesFile.self, from: data) else { return }
         guard saveTask == nil else { return } // our own unsaved changes win
+        captureHistory()
         lastSavedData = data
         adopt(file)
         setEditorText(text)
         recompute()
         restyleAll()
+        captureHistory()
         scheduleAnalysis()
+    }
+
+    // MARK: - History
+
+    /// Before text disappears, the state with that text is kept for the history: right away for a
+    /// bigger deletion (selection deleted, cut, merge, archive …), and for a run of single
+    /// backspaces once it has removed a few characters (fixing a typo doesn't count).
+    private func keepStateBeforeDeletion(old: String, new: String) {
+        guard loaded else { return }
+        let removed = Self.removedLength(from: old, to: new)
+        if removed >= 8 {
+            keepForHistory((Date(), currentFile()))
+            deletionRun = nil
+        } else if removed > 0 {
+            if deletionRun == nil { deletionRun = (Date(), currentFile(), 0, false) }
+            deletionRun!.deleted += removed
+            if deletionRun!.deleted >= 8, !deletionRun!.kept, let run = deletionRun {
+                keepForHistory((run.date, run.file))
+                deletionRun!.kept = true
+            }
+        } else {
+            deletionRun = nil
+        }
+    }
+
+    private func keepForHistory(_ state: (date: Date, file: NotesFile)) {
+        pendingHistory.append(state)
+        if pendingHistory.count > 20 { pendingHistory.removeFirst() }
+        scheduleHistoryCapture()
+    }
+
+    /// Characters replaced or deleted by an edit (common start and end of both texts left out).
+    private static func removedLength(from old: String, to new: String) -> Int {
+        let a = old as NSString, b = new as NSString
+        let shorter = min(a.length, b.length)
+        var prefix = 0
+        while prefix < shorter, a.character(at: prefix) == b.character(at: prefix) { prefix += 1 }
+        var suffix = 0
+        while suffix < shorter - prefix, a.character(at: a.length - 1 - suffix) == b.character(at: b.length - 1 - suffix) { suffix += 1 }
+        return a.length - prefix - suffix
+    }
+
+    /// A snapshot after 10 s without changes – or right away when the last one is two minutes old.
+    private func scheduleHistoryCapture() {
+        historyTask?.cancel()
+        let overdue = Date().timeIntervalSince(lastHistoryCapture) > 120
+        historyTask = Task { [weak self] in
+            try? await Task.sleep(for: overdue ? .milliseconds(50) : .seconds(10))
+            guard !Task.isCancelled else { return }
+            self?.captureHistory()
+        }
+    }
+
+    /// Writes the kept states and the current one to the history (skipping unchanged ones).
+    func captureHistory() {
+        guard loaded else { return }
+        historyTask?.cancel()
+        historyTask = nil
+        for state in pendingHistory { history.record(state.file, at: state.date) }
+        pendingHistory = []
+        history.record(currentFile())
+        lastHistoryCapture = Date()
+    }
+
+    /// Replaces all notes with an older version (types and dates included). Undoable with ⌘Z;
+    /// the current state goes into the history first.
+    func restore(_ file: NotesFile) {
+        guard loaded, let tv = textView else { return }
+        captureHistory()
+        let previousRecords = records
+        for note in file.notes {
+            records[note.id] = NoteRecord(created: note.created, lastChecked: note.lastChecked, type: note.noteType)
+        }
+        // Let the restored text find the IDs of that version (that's where its types live).
+        orphans = matchPool + orphans
+        matchPool = file.notes.map { ($0.id, NoteParser.parse($0.title).first?.key ?? "") }
+        let undo = tv.undoManager
+        undo?.beginUndoGrouping()
+        performEdits([(NSRange(location: 0, length: (text as NSString).length), file.render())], actionName: "Restore Version")
+        undo?.registerUndo(withTarget: self) { model in
+            MainActor.assumeIsolated { model.replaceRecords(previousRecords) }
+        }
+        undo?.endUndoGrouping()
+        saveNow()
+    }
+
+    private func replaceRecords(_ newRecords: [String: NoteRecord]) {
+        let current = records
+        records = newRecords
+        textView?.undoManager?.registerUndo(withTarget: self) { model in
+            MainActor.assumeIsolated { model.replaceRecords(current) }
+        }
+        recompute()
+        restyleAll()
+        scheduleSave()
+    }
+
+    /// Whether a note from the history is in the notes right now (same ID or same title).
+    func contains(_ stored: StoredNote) -> Bool {
+        let key = NoteParser.parse(stored.title).first?.key ?? ""
+        return notes.contains { $0.id == stored.id || (!key.isEmpty && $0.key == key) }
+    }
+
+    /// Puts a deleted note back – after the note it followed, else at the end – with its type.
+    func putBack(_ stored: StoredNote, after previousID: String?) {
+        guard loaded, !contains(stored) else { return }
+        let block = stored.lines.joined(separator: "\n")
+        let ns = text as NSString
+        let edit: Edit
+        if let previousID, let before = notes.first(where: { $0.id == previousID }) {
+            edit = (NSRange(location: NSMaxRange(before.range), length: 0), "\n\n" + block)
+        } else if previousID == nil, let first = notes.first {
+            edit = (NSRange(location: first.range.location, length: 0), block + "\n\n")
+        } else {
+            let separator = ns.length == 0 || text.hasSuffix("\n\n") ? "" : text.hasSuffix("\n") ? "\n" : "\n\n"
+            edit = (NSRange(location: ns.length, length: 0), separator + block + "\n")
+        }
+        records[stored.id] = NoteRecord(created: stored.created, lastChecked: stored.lastChecked, type: stored.noteType)
+        orphans.insert((id: stored.id, key: NoteParser.parse(stored.title).first?.key ?? ""), at: 0)
+        performEdits([edit], actionName: "Put Back Note")
+        if let note = notes.first(where: { $0.id == stored.id }) { reveal(note) }
     }
 }
 

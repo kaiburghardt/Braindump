@@ -327,7 +327,7 @@ final class LinkPreviewService {
 }
 
 /// Follows a redirect only to HTTPS on the same host, so the Authorization header never leaves it.
-private final class SameHostRedirects: NSObject, URLSessionTaskDelegate, Sendable {
+final class SameHostRedirects: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest) async -> URLRequest? {
         guard request.url?.scheme == "https", request.url?.host() == task.originalRequest?.url?.host() else { return nil }

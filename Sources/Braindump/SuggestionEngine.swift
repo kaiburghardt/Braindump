@@ -6,6 +6,14 @@ enum LineVerdict: Sendable {
     case todo, radar, note
 }
 
+/// A note waiting to be classified: its title (what gets classified) and a few detail lines
+/// for context (only the AI server sees those).
+struct ClassifyCandidate: Sendable {
+    let key: String
+    let text: String
+    var details: [String] = []
+}
+
 // MARK: - Structured output for Apple's on-device model
 
 @Generable
@@ -31,12 +39,13 @@ struct ClassificationBatch {
 // MARK: - Engine
 
 /// Looks at note titles and decides: to-do, radar (keep an eye on it) or just a note.
-/// Order: Apple Intelligence (if available) → our own mini classifier (trained locally,
-/// learns from you) → simple keyword rules while the classifier is still training.
+/// Order: the AI server from Settings (if set up) → Apple Intelligence (if available) → our own
+/// mini classifier (trained locally, learns from you) → simple keyword rules while the classifier
+/// is still training. A model that fails for a batch hands it to the next one in line.
 @MainActor
 @Observable
 final class SuggestionEngine {
-    enum Backend: Equatable { case appleIntelligence, classifier, heuristic }
+    enum Backend: Equatable { case server, appleIntelligence, classifier, heuristic }
 
     private(set) var verdicts: [String: LineVerdict] = [:]
     private(set) var backend: Backend = .heuristic
@@ -46,17 +55,21 @@ final class SuggestionEngine {
 
     @ObservationIgnored var onResults: (@MainActor () -> Void)?
     @ObservationIgnored var onBackendChange: (@MainActor () -> Void)?
-    @ObservationIgnored private var queue: [(key: String, text: String)] = []
+    @ObservationIgnored private var queue: [ClassifyCandidate] = []
     @ObservationIgnored private var worker: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var classifierReady = false
     @ObservationIgnored private var appleStatus: String?
     @ObservationIgnored private let classifier = LineClassifier(directory: NotesModel.supportURL.appending(path: "Classifier"))
     @ObservationIgnored private var pendingExamples: [LineExample]?
+    /// The AI server from Settings, if one is set up – then it classifies first.
+    @ObservationIgnored var ai: AIService?
+    /// A few of your own decisions (title → "todo" / "radar" / "note"), shown to the AI server as examples.
+    @ObservationIgnored var examples: [(text: String, label: String)] = []
 
     /// Minimum confidence before the classifier suggests anything.
     private static let threshold = 0.6
-    private static let batchSize = 16
+    private var batchSize: Int { backend == .server ? 30 : 16 }
 
     private static let instructions = """
     You sort the notes of a product manager's personal scratchpad. Notes are German or English \
@@ -98,7 +111,7 @@ final class SuggestionEngine {
     }
 
     func refreshAvailability() {
-        let newBackend: Backend
+        var newBackend: Backend
         switch SystemLanguageModel.default.availability {
         case .available:
             newBackend = .appleIntelligence
@@ -112,6 +125,7 @@ final class SuggestionEngine {
             @unknown default: "Apple Intelligence unavailable"
             }
         }
+        if ai?.isConfigured == true { newBackend = .server }
         if newBackend != backend {
             backend = newBackend
             reset()
@@ -122,6 +136,8 @@ final class SuggestionEngine {
 
     private func updateStatus() {
         switch backend {
+        case .server:
+            statusText = ai.map { "\($0.model) · \($0.host)" } ?? "AI server"
         case .appleIntelligence:
             statusText = "Apple Intelligence · on this Mac"
         case .classifier:
@@ -142,7 +158,7 @@ final class SuggestionEngine {
         queue = []
     }
 
-    func enqueue(_ items: [(key: String, text: String)]) {
+    func enqueue(_ items: [ClassifyCandidate]) {
         var pending = Set(queue.map(\.key))
         for item in items where verdicts[item.key] == nil && !pending.contains(item.key) {
             queue.append(item)
@@ -156,7 +172,7 @@ final class SuggestionEngine {
         isWorking = true
         worker = Task { [self] in
             while !queue.isEmpty {
-                let batch = Array(queue.prefix(Self.batchSize))
+                let batch = Array(queue.prefix(batchSize))
                 queue.removeFirst(batch.count)
                 let gen = generation
                 let result = await classify(batch)
@@ -170,9 +186,12 @@ final class SuggestionEngine {
         }
     }
 
-    private func classify(_ batch: [(key: String, text: String)]) async -> [String: LineVerdict] {
-        if backend == .appleIntelligence, let result = await classifyWithModel(batch) {
-            return result
+    private func classify(_ batch: [ClassifyCandidate]) async -> [String: LineVerdict] {
+        if backend == .server, let ai, let result = await classifyWithServer(batch, ai: ai) {
+            return applyingRules(result, to: batch)
+        }
+        if SystemLanguageModel.default.isAvailable, let result = await classifyWithModel(batch) {
+            return applyingRules(result, to: batch)
         }
         if classifierReady {
             let predictions = await classifier.classify(batch.map(\.text))
@@ -191,11 +210,64 @@ final class SuggestionEngine {
         return heuristic(batch)
     }
 
-    private func heuristic(_ batch: [(key: String, text: String)]) -> [String: LineVerdict] {
+    private func heuristic(_ batch: [ClassifyCandidate]) -> [String: LineVerdict] {
         Dictionary(batch.map { ($0.key, Heuristic.classify($0.text)) }, uniquingKeysWith: { first, _ in first })
     }
 
-    private func classifyWithModel(_ batch: [(key: String, text: String)]) async -> [String: LineVerdict]? {
+    /// The unambiguous cases (`TODO`, `->`, `Idee:` …) win over any model.
+    private func applyingRules(_ verdicts: [String: LineVerdict], to batch: [ClassifyCandidate]) -> [String: LineVerdict] {
+        var out = verdicts
+        for item in batch {
+            if let rule = Heuristic.rule(item.text) { out[item.key] = rule }
+        }
+        return out
+    }
+
+    // MARK: AI server
+
+    private struct ServerBatch: Decodable {
+        struct Item: Decodable {
+            let line: Int
+            let category: String
+        }
+        let lines: [Item]
+    }
+
+    private static let serverSchema = Schema.object([
+        "lines": Schema.array(Schema.object([
+            "line": Schema.integer,
+            "category": Schema.oneOf(["todo", "radar", "note"]),
+        ])),
+    ])
+
+    private func classifyWithServer(_ batch: [ClassifyCandidate], ai: AIService) async -> [String: LineVerdict]? {
+        var prompt = ""
+        if !examples.isEmpty {
+            prompt += "How the author sorted some of their own notes:\n"
+            prompt += examples.map { "- \"\(String($0.text.prefix(160)))\" → \($0.label)" }.joined(separator: "\n")
+            prompt += "\n\n"
+        }
+        prompt += "Classify the title of each of these \(batch.count) notes. Indented lines are the note's details, only for context:\n\n"
+        for (i, item) in batch.enumerated() {
+            prompt += "\(i + 1). \(String(item.text.prefix(240)))\n"
+            for detail in item.details.prefix(2) { prompt += "   \(String(detail.prefix(160)))\n" }
+        }
+        let system = Self.instructions + " Return one entry for every numbered note, with its number."
+        guard let answer = try? await ai.complete(ServerBatch.self, task: "classify_notes", system: system, user: prompt,
+                                                  schema: Self.serverSchema, maxTokens: 4000) else { return nil }
+        var out: [String: LineVerdict] = [:]
+        for item in answer.lines {
+            let i = item.line - 1
+            guard batch.indices.contains(i) else { continue }
+            out[batch[i].key] = LineVerdict(label: item.category)
+        }
+        for entry in batch where out[entry.key] == nil { out[entry.key] = .note }
+        return out
+    }
+
+    // MARK: Apple Intelligence
+
+    private func classifyWithModel(_ batch: [ClassifyCandidate]) async -> [String: LineVerdict]? {
         do {
             let session = LanguageModelSession(instructions: Self.instructions)
             let listing = batch.enumerated()
@@ -255,6 +327,7 @@ extension LineVerdict {
 extension SuggestionEngine.Backend {
     var symbol: String {
         switch self {
+        case .server: "sparkles"
         case .appleIntelligence: "apple.intelligence"
         case .classifier: "brain"
         case .heuristic: "text.magnifyingglass"

@@ -97,6 +97,16 @@ struct SidebarView: View {
             Text(model.aiEnabled ? model.engine.statusText : "Suggestions off")
                 .lineLimit(2)
             Spacer(minLength: 0)
+            if model.aiEnabled {
+                Button {
+                    model.reanalyzeAll()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.engine.isWorking)
+                .help("Refresh suggestions – look at all notes again")
+            }
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -106,6 +116,13 @@ struct SidebarView: View {
 }
 
 // MARK: - Building blocks
+
+extension NotesModel {
+    /// Note text in the sidebar is set in the editor's font, a bit smaller – labels stay in the system font.
+    func listFont(size: CGFloat = 12) -> Font {
+        Font(EditorFont(family: fontFamily, size: size).font())
+    }
+}
 
 struct SectionHeader: View {
     let title: String
@@ -172,6 +189,7 @@ struct RadarRow: View {
                 .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.displayTitle(for: item.note))
+                    .font(model.listFont())
                     .lineLimit(2)
                 HStack(spacing: 6) {
                     Text(Self.ageLabel(days, checked: item.lastChecked != nil))
@@ -259,13 +277,14 @@ struct TodoRow: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.displayTitle(for: note))
+                    .font(model.listFont())
                     .strikethrough(done, color: .secondary)
                     .foregroundStyle(done ? .secondary : .primary)
                     .lineLimit(3)
                 if let detail = note.detailLines.first(where: { !$0.raw.hasPrefix("http") }) {
                     let text = detail.raw.trimmingCharacters(in: .whitespaces)
                     Text(note.detailLines.count > 1 ? "\(text) · +\(note.detailLines.count - 1)" : text)
-                        .font(.caption)
+                        .font(model.listFont(size: 10))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -305,7 +324,7 @@ struct SuggestionCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Text(model.displayTitle(for: suggestion.note))
-                .font(.callout)
+                .font(model.listFont())
                 .lineLimit(4)
                 .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 6) {
