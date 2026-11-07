@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <sub>Version 0.1 · macOS 26 or later · Apple silicon · free · a private, non-commercial project</sub>
+  <sub>Version 0.2 · macOS 26 or later · Apple silicon · free · a private, non-commercial project</sub>
 </p>
 
 <p align="center">
