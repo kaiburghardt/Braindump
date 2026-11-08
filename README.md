@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS"></a>
+  <a href="../../releases/latest"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/download-white.svg"><img src="docs/download-black.svg" width="160" height="56" alt="Download for macOS"></picture></a>
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-    <img src="docs/screenshot-light.png" width="900" alt="Braindump window: notes and to-dos on the left, with buttons for to-do, radar, the AI actions and history above them; on the right the radar, the to-do list and a suggestion to turn a note into a to-do">
+    <img src="docs/screenshot-light.png" width="900" alt="Braindump on a MacBook screen: notes and to-dos on the left, with buttons for to-do, radar, the AI actions and history above them; on the right the radar, the to-do list and a suggestion to turn a note into a to-do">
   </picture>
 </p>
 
